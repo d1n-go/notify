@@ -1,4 +1,4 @@
-module github.com/demen1n/notify
+module github.com/d1n-go/notify
 
 go 1.24
 

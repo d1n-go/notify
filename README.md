@@ -7,7 +7,7 @@ This library provides ability to send notifications using multiple services:
 
 ## Install
 
-`go get -u github.com/demen1n/notify`
+`go get -u github.com/d1n-go/notify`
 
 ## Usage
 
@@ -29,7 +29,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/demen1n/notify"
+	"github.com/d1n-go/notify"
 )
 
 func main() {
