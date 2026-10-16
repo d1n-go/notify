@@ -25,11 +25,20 @@ import (
 
 func main() {
 	notifiers := []notify.Notifier{
-		notify.NewEmail(notify.EmailParams{}),
-		notify.NewTelegram(notify.TelegramParams{)),
+		notify.NewEmail(notify.EmailParams{
+			User:     "foo@bar.com",
+			Password: "secret",
+			Server:   "mail.bar.com",
+			To:       []string{"baz@bar.com"},
+		}),
+		notify.NewTelegram(notify.TelegramParams{
+			Token:  "bot-token",
+			ChatID: "chat-id",
+		}),
 	}
-	err = notify.Send(context.Background(), notifiers, "Hello from subject", "Hello, world!")
+	err := notify.Send(context.Background(), notifiers, "Hello from subject", "Hello, world!")
 	if err != nil {
-		fmt.Printf("Sent message error: %s", err))
+		fmt.Printf("Sent message error: %s\n", err)
 	}
 }
+```
