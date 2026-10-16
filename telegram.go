@@ -17,6 +17,12 @@ const (
 
 	// telegramMaxMessageLen is the Bot API limit for message text, in UTF-16 code units.
 	telegramMaxMessageLen = 4096
+
+	// DefaultTelegramMaxRetries is used when TelegramParams.MaxRetries is 0.
+	DefaultTelegramMaxRetries = 3
+
+	defaultRetryBaseDelay = time.Second
+	maxRetryDelay         = 30 * time.Second
 )
 
 var defaultHTTPClient = &http.Client{Timeout: 30 * time.Second}
@@ -29,6 +35,12 @@ type TelegramParams struct {
 
 	// HTTPClient is used for Bot API requests. Defaults to a client with a 30s timeout.
 	HTTPClient *http.Client
+
+	// MaxRetries is how many times sending is retried on network errors, 5xx and
+	// 429 Too Many Requests (waiting retry_after from the response, unless it is
+	// over 30s). Other delays grow exponentially from 1s.
+	// 0 uses DefaultTelegramMaxRetries, a negative value disables retries.
+	MaxRetries int
 }
 
 // MessageStorage keeps the ID of the last sent message so it can be deleted
@@ -41,13 +53,15 @@ type MessageStorage interface {
 
 type Telegram struct {
 	TelegramParams
-	baseURL string
+	baseURL        string
+	retryBaseDelay time.Duration
 }
 
 func NewTelegram(telegramParams TelegramParams) *Telegram {
 	return &Telegram{
 		TelegramParams: telegramParams,
 		baseURL:        defaultAPIURL,
+		retryBaseDelay: defaultRetryBaseDelay,
 	}
 }
 
@@ -60,10 +74,37 @@ type TelegramResponse struct {
 	Ok          bool   `json:"ok"`
 	ErrorCode   int    `json:"error_code,omitempty"`
 	Description string `json:"description,omitempty"`
-	Result      struct {
+	Parameters  struct {
+		RetryAfter int `json:"retry_after,omitempty"`
+	} `json:"parameters"`
+	Result struct {
 		MessageID int `json:"message_id"`
 	} `json:"result"`
 }
+
+// TelegramAPIError is returned when the Bot API responds with an error.
+type TelegramAPIError struct {
+	Method      string
+	StatusCode  int    // HTTP status code
+	ErrorCode   int    // error_code from the response, 0 if absent
+	Description string // description from the response, empty if absent
+	RetryAfter  time.Duration
+}
+
+func (e *TelegramAPIError) Error() string {
+	if e.Description != "" {
+		return fmt.Sprintf("telegram %s: %s (%d)", e.Method, e.Description, e.ErrorCode)
+	}
+	return fmt.Sprintf("telegram %s: unexpected response: %d %s", e.Method, e.StatusCode, http.StatusText(e.StatusCode))
+}
+
+// networkError marks failures to get a response at all, which are worth retrying.
+type networkError struct {
+	err error
+}
+
+func (e *networkError) Error() string { return "failed to send request: " + e.err.Error() }
+func (e *networkError) Unwrap() error { return e.err }
 
 // Send sends "[subject]\n\nmsg" to the chat. Text over the Bot API limit is truncated.
 // Failures to delete the previous message or to store the new message ID are ignored.
@@ -111,7 +152,7 @@ func (t *Telegram) call(ctx context.Context, method string, payload any) (*Teleg
 			// url.Error.Error() contains the full URL with the bot token
 			ue.URL = t.baseURL + "<token>/" + method
 		}
-		return nil, fmt.Errorf("failed to send request: %w", err)
+		return nil, &networkError{err: err}
 	}
 	defer resp.Body.Close()
 
@@ -119,10 +160,13 @@ func (t *Telegram) call(ctx context.Context, method string, payload any) (*Teleg
 	decodeErr := json.NewDecoder(resp.Body).Decode(&res)
 
 	if resp.StatusCode != http.StatusOK || !res.Ok {
-		if decodeErr == nil && res.Description != "" {
-			return nil, fmt.Errorf("telegram %s: %s (%d)", method, res.Description, res.ErrorCode)
+		apiErr := &TelegramAPIError{Method: method, StatusCode: resp.StatusCode}
+		if decodeErr == nil {
+			apiErr.ErrorCode = res.ErrorCode
+			apiErr.Description = res.Description
+			apiErr.RetryAfter = time.Duration(res.Parameters.RetryAfter) * time.Second
 		}
-		return nil, fmt.Errorf("telegram %s: unexpected response: %s", method, resp.Status)
+		return nil, apiErr
 	}
 	if decodeErr != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", decodeErr)
@@ -130,15 +174,65 @@ func (t *Telegram) call(ctx context.Context, method string, payload any) (*Teleg
 	return &res, nil
 }
 
+// sendMessage sends msg, retrying transient failures. A retry after a network
+// error may duplicate the message if the first request actually reached Telegram.
 func (t *Telegram) sendMessage(ctx context.Context, msg string) (int, error) {
-	res, err := t.call(ctx, "sendMessage", TelegramMessage{
+	payload := TelegramMessage{
 		ChatID: t.ChatID,
 		Text:   msg,
-	})
-	if err != nil {
-		return -1, err
 	}
-	return res.Result.MessageID, nil
+
+	for attempt := 0; ; attempt++ {
+		res, err := t.call(ctx, "sendMessage", payload)
+		if err == nil {
+			return res.Result.MessageID, nil
+		}
+
+		delay, ok := t.retryDelay(ctx, err, attempt)
+		if !ok {
+			return -1, err
+		}
+
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return -1, errors.Join(err, ctx.Err())
+		case <-timer.C:
+		}
+	}
+}
+
+// retryDelay reports whether the failed attempt should be retried and how long to wait before it.
+func (t *Telegram) retryDelay(ctx context.Context, err error, attempt int) (time.Duration, bool) {
+	maxRetries := t.MaxRetries
+	if maxRetries == 0 {
+		maxRetries = DefaultTelegramMaxRetries
+	}
+	if attempt >= maxRetries || ctx.Err() != nil {
+		return 0, false
+	}
+
+	backoff := min(t.retryBaseDelay<<attempt, maxRetryDelay)
+
+	var apiErr *TelegramAPIError
+	var netErr *networkError
+	switch {
+	case errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusTooManyRequests:
+		if apiErr.RetryAfter > maxRetryDelay {
+			return 0, false // long flood wait: fail now instead of blocking the caller
+		}
+		if apiErr.RetryAfter > 0 {
+			return apiErr.RetryAfter, true
+		}
+		return backoff, true
+	case errors.As(err, &apiErr) && apiErr.StatusCode >= 500:
+		return backoff, true
+	case errors.As(err, &netErr):
+		return backoff, true
+	default:
+		return 0, false
+	}
 }
 
 func (t *Telegram) deleteMessage(ctx context.Context, messageID int) error {

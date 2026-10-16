@@ -3,6 +3,7 @@ package notify
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -31,7 +32,11 @@ type fakeTelegram struct {
 	sendOK    bool
 	sendMsgID int
 
+	// sendFailures are HTTP statuses returned by sendMessage before it behaves according to sendOK
+	sendFailures []int
+
 	sentText  string
+	sendCalls int
 	deletedID int
 }
 
@@ -41,7 +46,15 @@ func (f *fakeTelegram) handler() http.Handler {
 		var m TelegramMessage
 		_ = json.NewDecoder(r.Body).Decode(&m)
 		f.sentText = m.Text
+		f.sendCalls++
 
+		if len(f.sendFailures) > 0 {
+			status := f.sendFailures[0]
+			f.sendFailures = f.sendFailures[1:]
+			w.WriteHeader(status)
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error_code": status, "description": http.StatusText(status)})
+			return
+		}
 		if !f.sendOK {
 			w.WriteHeader(http.StatusBadRequest)
 			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error_code": 400, "description": "Bad Request: chat not found"})
@@ -81,6 +94,7 @@ func makeTelegramWithServer(t *testing.T, f *fakeTelegram, storedID int) *Telegr
 		MS:                 &mockStorage{lastID: storedID},
 	})
 	tg.baseURL = ts.URL + "/bot"
+	tg.retryBaseDelay = time.Millisecond
 	return tg
 }
 
@@ -119,6 +133,13 @@ func TestTelegramSendSendFails(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "chat not found") {
 		t.Errorf("expected API description in error, got: %v", err)
+	}
+	var apiErr *TelegramAPIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected *TelegramAPIError with status 400, got: %#v", err)
+	}
+	if f.sendCalls != 1 {
+		t.Errorf("4xx must not be retried, got %d calls", f.sendCalls)
 	}
 	if got := tg.MS.(*mockStorage).lastID; got != 101 {
 		t.Errorf("stored message ID must not change on failure, got %d", got)
@@ -171,6 +192,7 @@ func TestTelegramErrorDoesNotLeakToken(t *testing.T) {
 
 	tg := NewTelegram(TelegramParams{Token: "secret-token", ChatID: "chat42"})
 	tg.baseURL = ts.URL + "/bot"
+	tg.retryBaseDelay = time.Millisecond
 
 	err := tg.Send(testCtx(t), "Subject", "Body")
 	if err == nil {
@@ -178,6 +200,96 @@ func TestTelegramErrorDoesNotLeakToken(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "secret-token") {
 		t.Errorf("error leaks bot token: %v", err)
+	}
+}
+
+func TestTelegramSendRetriesTransientErrors(t *testing.T) {
+	f := &fakeTelegram{sendOK: true, sendMsgID: 7, sendFailures: []int{http.StatusTooManyRequests, http.StatusBadGateway}}
+	tg := makeTelegramWithServer(t, f, 0)
+
+	if err := tg.Send(testCtx(t), "Retry", "Body"); err != nil {
+		t.Fatalf("expected success after retries, got: %v", err)
+	}
+	if f.sendCalls != 3 {
+		t.Errorf("expected 3 send attempts, got %d", f.sendCalls)
+	}
+	if got := tg.MS.(*mockStorage).lastID; got != 7 {
+		t.Errorf("expected stored message ID 7, got %d", got)
+	}
+}
+
+func TestTelegramSendGivesUpAfterMaxRetries(t *testing.T) {
+	f := &fakeTelegram{sendOK: true, sendFailures: []int{500, 500, 500}}
+	tg := makeTelegramWithServer(t, f, 0)
+	tg.MaxRetries = 2
+
+	err := tg.Send(testCtx(t), "Retry", "Body")
+	var apiErr *TelegramAPIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != 500 {
+		t.Fatalf("expected last 500 error, got: %v", err)
+	}
+	if f.sendCalls != 3 {
+		t.Errorf("expected 1 attempt + 2 retries, got %d", f.sendCalls)
+	}
+}
+
+func TestTelegramSendRetriesDisabled(t *testing.T) {
+	f := &fakeTelegram{sendOK: true, sendFailures: []int{500}}
+	tg := makeTelegramWithServer(t, f, 0)
+	tg.MaxRetries = -1
+
+	if err := tg.Send(testCtx(t), "Retry", "Body"); err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if f.sendCalls != 1 {
+		t.Errorf("expected a single attempt, got %d", f.sendCalls)
+	}
+}
+
+func TestTelegramSendRetryStopsOnContextCancel(t *testing.T) {
+	f := &fakeTelegram{sendOK: true, sendFailures: []int{500, 500, 500, 500}}
+	tg := makeTelegramWithServer(t, f, 0)
+	tg.retryBaseDelay = time.Hour
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	err := tg.Send(ctx, "Retry", "Body")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected deadline exceeded, got: %v", err)
+	}
+	if f.sendCalls != 1 {
+		t.Errorf("expected a single attempt, got %d", f.sendCalls)
+	}
+}
+
+func TestTelegramRetryDelay(t *testing.T) {
+	tg := NewTelegram(TelegramParams{})
+	ctx := context.Background()
+
+	tests := []struct {
+		name    string
+		err     error
+		attempt int
+		want    time.Duration
+		wantOK  bool
+	}{
+		{"429 with retry_after", &TelegramAPIError{StatusCode: 429, RetryAfter: 5 * time.Second}, 0, 5 * time.Second, true},
+		{"429 with long flood wait", &TelegramAPIError{StatusCode: 429, RetryAfter: time.Hour}, 0, 0, false},
+		{"429 without retry_after", &TelegramAPIError{StatusCode: 429}, 1, 2 * time.Second, true},
+		{"5xx backoff", &TelegramAPIError{StatusCode: 502}, 2, 4 * time.Second, true},
+		{"network error", &networkError{err: errors.New("boom")}, 0, time.Second, true},
+		{"4xx", &TelegramAPIError{StatusCode: 400}, 0, 0, false},
+		{"other error", errors.New("marshal failed"), 0, 0, false},
+		{"retries exhausted", &TelegramAPIError{StatusCode: 502}, DefaultTelegramMaxRetries, 0, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := tg.retryDelay(ctx, tt.err, tt.attempt)
+			if got != tt.want || ok != tt.wantOK {
+				t.Errorf("retryDelay() = %v, %v; want %v, %v", got, ok, tt.want, tt.wantOK)
+			}
+		})
 	}
 }
 
