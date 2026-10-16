@@ -170,16 +170,20 @@ Key: func(m notify.Message) string { return "" },
 `notify.NewSlogHandler` is a `slog.Handler` that sends log records (errors by default) through notifiers. The subject is the log message, the record level becomes `Message.Level` (so email gets `[ERROR]` and Telegram 🔴), and the body lists time, source and attributes:
 
 ```go
-notifyHandler := notify.NewSlogHandler(
-	[]notify.Notifier{notify.Throttle(tg, notify.ThrottleParams{Window: 10 * time.Minute})},
-	&notify.SlogHandlerOptions{
-		Level:     slog.LevelError,
-		AddSource: true,
-		Async:     true,
-		OnError:   func(err error) { fmt.Fprintln(os.Stderr, "notify:", err) },
+// send in the background so logging never blocks on the network
+alerts := notify.Async(
+	notify.Throttle(tg, notify.ThrottleParams{Window: 10 * time.Minute}),
+	notify.AsyncParams{
+		OnError: func(m notify.Message, err error) { fmt.Fprintln(os.Stderr, "notify:", err) },
 	},
 )
-defer notifyHandler.Wait() // let async sends finish before exit
+defer alerts.Close(context.Background()) // let queued alerts go out before exit
+
+notifyHandler := notify.NewSlogHandler([]notify.Notifier{alerts}, &notify.SlogHandlerOptions{
+	Level:     slog.LevelError,
+	AddSource: true,
+	OnError:   func(err error) { fmt.Fprintln(os.Stderr, "notify:", err) }, // e.g. ErrQueueFull
+})
 
 // Go 1.26+: log to stdout and send errors to Telegram
 logger := slog.New(slog.NewMultiHandler(slog.NewTextHandler(os.Stdout, nil), notifyHandler))
@@ -191,8 +195,8 @@ Options:
 - `Level` — minimum level to send, `slog.LevelError` by default.
 - `AddSource` — add file and line of the log call.
 - `Timeout` — limit for sending one record, 30 seconds by default. Cancellation of the context passed to the logger is ignored, so a finished request doesn't abort the notification.
-- `Async` — send in the background instead of blocking the log call; call `Wait` before exit.
-- `OnError` — called when sending fails (`slog.Logger` ignores handler errors).
+- `OnError` — called when sending fails (`slog.Logger` ignores handler errors). With `notify.Async` this only sees enqueue errors such as `ErrQueueFull`; send errors go to `AsyncParams.OnError`.
+- `Async` — deprecated: wrap the notifier with `notify.Async` as shown above. Unlike it, this option starts a goroutine per record with no limit, and `Wait` has no timeout.
 - `Subject` — custom subject builder, the log message by default.
 
 Throttling the notifiers is recommended: an error logged in a loop otherwise turns into a flood of messages.

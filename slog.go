@@ -28,6 +28,9 @@ type SlogHandlerOptions struct {
 
 	// Async sends records in the background instead of blocking the log call.
 	// Use SlogHandler.Wait before exit to let pending sends finish.
+	//
+	// Deprecated: wrap the notifier with Async instead, which bounds the queue
+	// and drains it on Close: NewSlogHandler([]Notifier{Async(n, AsyncParams{})}, opts).
 	Async bool
 
 	// OnError is called when sending a record fails. slog.Logger ignores handler
@@ -107,6 +110,9 @@ func (h *SlogHandler) Handle(ctx context.Context, r slog.Record) error {
 }
 
 // Wait blocks until all records sent in Async mode are processed.
+//
+// Deprecated: SlogHandlerOptions.Async is deprecated; with the Async wrapper
+// use AsyncNotifier.Close instead.
 func (h *SlogHandler) Wait() {
 	h.wg.Wait()
 }
