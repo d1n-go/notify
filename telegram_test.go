@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -36,8 +37,17 @@ type fakeTelegram struct {
 	sendFailures []int
 
 	sentText  string
+	sentMsg   TelegramMessage
 	sendCalls int
 	deletedID int
+
+	docs []fakeDocument
+}
+
+type fakeDocument struct {
+	fields map[string]string
+	name   string
+	data   string
 }
 
 func (f *fakeTelegram) handler() http.Handler {
@@ -46,6 +56,7 @@ func (f *fakeTelegram) handler() http.Handler {
 		var m TelegramMessage
 		_ = json.NewDecoder(r.Body).Decode(&m)
 		f.sentText = m.Text
+		f.sentMsg = m
 		f.sendCalls++
 
 		if len(f.sendFailures) > 0 {
@@ -63,6 +74,28 @@ func (f *fakeTelegram) handler() http.Handler {
 		var resp TelegramResponse
 		resp.Ok = true
 		resp.Result.MessageID = f.sendMsgID
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+	mux.HandleFunc("/bot123/sendDocument", func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		doc := fakeDocument{fields: map[string]string{}}
+		for k, v := range r.MultipartForm.Value {
+			doc.fields[k] = v[0]
+		}
+		file, header, err := r.FormFile("document")
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		data, _ := io.ReadAll(file)
+		doc.name, doc.data = header.Filename, string(data)
+		f.docs = append(f.docs, doc)
+
+		var resp TelegramResponse
+		resp.Ok = true
 		_ = json.NewEncoder(w).Encode(resp)
 	})
 	mux.HandleFunc("/bot123/deleteMessage", func(w http.ResponseWriter, r *http.Request) {
@@ -108,7 +141,7 @@ func TestTelegramSendSuccess(t *testing.T) {
 	f := &fakeTelegram{deleteOK: true, sendOK: true, sendMsgID: 555}
 	tg := makeTelegramWithServer(t, f, 101)
 
-	if err := tg.Send(testCtx(t), "Subject", "Body text"); err != nil {
+	if err := tg.Send(testCtx(t), Message{Subject: "Subject", Body: "Body text"}); err != nil {
 		t.Fatalf("expected success, got error: %v", err)
 	}
 
@@ -127,7 +160,7 @@ func TestTelegramSendSendFails(t *testing.T) {
 	f := &fakeTelegram{deleteOK: true, sendOK: false}
 	tg := makeTelegramWithServer(t, f, 101)
 
-	err := tg.Send(testCtx(t), "FailSubject", "FailBody")
+	err := tg.Send(testCtx(t), Message{Subject: "FailSubject", Body: "FailBody"})
 	if err == nil {
 		t.Fatal("expected error due to send failure, got nil")
 	}
@@ -150,7 +183,7 @@ func TestTelegramSendDeleteFailsButSendOK(t *testing.T) {
 	f := &fakeTelegram{deleteOK: false, sendOK: true, sendMsgID: 888}
 	tg := makeTelegramWithServer(t, f, 101)
 
-	if err := tg.Send(testCtx(t), "IgnoreDel", "StillSend"); err != nil {
+	if err := tg.Send(testCtx(t), Message{Subject: "IgnoreDel", Body: "StillSend"}); err != nil {
 		t.Fatalf("expected send to succeed despite delete failure, got: %v", err)
 	}
 
@@ -163,7 +196,7 @@ func TestTelegramSendNoStoredMessage(t *testing.T) {
 	f := &fakeTelegram{deleteOK: true, sendOK: true, sendMsgID: 1}
 	tg := makeTelegramWithServer(t, f, 0)
 
-	if err := tg.Send(testCtx(t), "First", "Message"); err != nil {
+	if err := tg.Send(testCtx(t), Message{Subject: "First", Body: "Message"}); err != nil {
 		t.Fatalf("expected success, got error: %v", err)
 	}
 	if f.deletedID != 0 {
@@ -175,7 +208,7 @@ func TestTelegramSendTruncatesLongMessage(t *testing.T) {
 	f := &fakeTelegram{sendOK: true, sendMsgID: 1}
 	tg := makeTelegramWithServer(t, f, 0)
 
-	if err := tg.Send(testCtx(t), "Long", strings.Repeat("я", 10000)); err != nil {
+	if err := tg.Send(testCtx(t), Message{Subject: "Long", Body: strings.Repeat("я", 10000)}); err != nil {
 		t.Fatalf("expected success, got error: %v", err)
 	}
 	if n := len(utf16.Encode([]rune(f.sentText))); n != telegramMaxMessageLen {
@@ -194,7 +227,7 @@ func TestTelegramErrorDoesNotLeakToken(t *testing.T) {
 	tg.baseURL = ts.URL + "/bot"
 	tg.retryBaseDelay = time.Millisecond
 
-	err := tg.Send(testCtx(t), "Subject", "Body")
+	err := tg.Send(testCtx(t), Message{Subject: "Subject", Body: "Body"})
 	if err == nil {
 		t.Fatal("expected network error, got nil")
 	}
@@ -203,11 +236,99 @@ func TestTelegramErrorDoesNotLeakToken(t *testing.T) {
 	}
 }
 
+func TestTelegramText(t *testing.T) {
+	tests := []struct {
+		name      string
+		m         Message
+		wantText  string
+		wantParse string
+	}{
+		{"plain", Message{Subject: "s", Body: "b"}, "[s]\n\nb", ""},
+		{"no subject", Message{Body: "b"}, "b", ""},
+		{"no body", Message{Subject: "s"}, "[s]", ""},
+		{"warn", Message{Subject: "s", Body: "b", Level: LevelWarn}, "⚠️ [s]\n\nb", ""},
+		{"error", Message{Subject: "s", Body: "b", Level: LevelError}, "🔴 [s]\n\nb", ""},
+		{"error without subject", Message{Body: "b", Level: LevelError}, "🔴\n\nb", ""},
+		{"html escapes subject", Message{Subject: "a<b", Body: "<b>bold</b>", Format: FormatHTML}, "[a&lt;b]\n\n<b>bold</b>", "HTML"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			text, parse := telegramText(tt.m)
+			if text != tt.wantText || parse != tt.wantParse {
+				t.Errorf("telegramText() = %q, %q; want %q, %q", text, parse, tt.wantText, tt.wantParse)
+			}
+		})
+	}
+}
+
+func TestTelegramTextLongHTMLFallsBackToPlain(t *testing.T) {
+	body := strings.Repeat("<b>x</b> &amp; ", 1000)
+
+	text, parse := telegramText(Message{Subject: "s", Body: body, Format: FormatHTML})
+
+	if parse != "" {
+		t.Errorf("expected plain text for truncated HTML, got parse mode %q", parse)
+	}
+	if strings.Contains(text, "<b>") || strings.Contains(text, "&amp;") {
+		t.Errorf("expected tags stripped and entities unescaped, got %q...", text[:40])
+	}
+	if utf16Len(text) > telegramMaxMessageLen {
+		t.Errorf("text exceeds limit: %d", utf16Len(text))
+	}
+}
+
+func TestTelegramSendMessageOptions(t *testing.T) {
+	f := &fakeTelegram{sendOK: true, sendMsgID: 77}
+	tg := makeTelegramWithServer(t, f, 0)
+	tg.MessageThreadID = 5
+
+	err := tg.Send(testCtx(t), Message{
+		Subject:     "Report",
+		Body:        "<i>see file</i>",
+		Format:      FormatHTML,
+		Silent:      true,
+		Attachments: []Attachment{{Name: "report.csv", ContentType: "text/csv", Data: []byte("a,b\n1,2\n")}},
+	})
+	if err != nil {
+		t.Fatalf("expected success, got: %v", err)
+	}
+
+	if f.sentMsg.ParseMode != "HTML" || !f.sentMsg.DisableNotification || f.sentMsg.MessageThreadID != 5 {
+		t.Errorf("unexpected sendMessage payload: %+v", f.sentMsg)
+	}
+	if len(f.docs) != 1 {
+		t.Fatalf("expected 1 document, got %d", len(f.docs))
+	}
+	doc := f.docs[0]
+	if doc.name != "report.csv" || doc.data != "a,b\n1,2\n" {
+		t.Errorf("unexpected document %q: %q", doc.name, doc.data)
+	}
+	if doc.fields["chat_id"] != "chat42" || doc.fields["message_thread_id"] != "5" || doc.fields["disable_notification"] != "true" {
+		t.Errorf("unexpected document fields: %v", doc.fields)
+	}
+	if !strings.Contains(doc.fields["reply_parameters"], `"message_id":77`) {
+		t.Errorf("expected document to reply to message 77, got %q", doc.fields["reply_parameters"])
+	}
+}
+
+func TestTelegramSendRejectsEmptyAttachment(t *testing.T) {
+	f := &fakeTelegram{sendOK: true}
+	tg := makeTelegramWithServer(t, f, 0)
+
+	err := tg.Send(testCtx(t), Message{Subject: "s", Attachments: []Attachment{{Name: "empty"}}})
+	if !errors.Is(err, ErrEmptyAttachment) {
+		t.Fatalf("expected ErrEmptyAttachment, got %v", err)
+	}
+	if f.sendCalls != 0 {
+		t.Errorf("nothing must be sent, got %d sendMessage calls", f.sendCalls)
+	}
+}
+
 func TestTelegramSendRetriesTransientErrors(t *testing.T) {
 	f := &fakeTelegram{sendOK: true, sendMsgID: 7, sendFailures: []int{http.StatusTooManyRequests, http.StatusBadGateway}}
 	tg := makeTelegramWithServer(t, f, 0)
 
-	if err := tg.Send(testCtx(t), "Retry", "Body"); err != nil {
+	if err := tg.Send(testCtx(t), Message{Subject: "Retry", Body: "Body"}); err != nil {
 		t.Fatalf("expected success after retries, got: %v", err)
 	}
 	if f.sendCalls != 3 {
@@ -223,7 +344,7 @@ func TestTelegramSendGivesUpAfterMaxRetries(t *testing.T) {
 	tg := makeTelegramWithServer(t, f, 0)
 	tg.MaxRetries = 2
 
-	err := tg.Send(testCtx(t), "Retry", "Body")
+	err := tg.Send(testCtx(t), Message{Subject: "Retry", Body: "Body"})
 	var apiErr *TelegramAPIError
 	if !errors.As(err, &apiErr) || apiErr.StatusCode != 500 {
 		t.Fatalf("expected last 500 error, got: %v", err)
@@ -238,7 +359,7 @@ func TestTelegramSendRetriesDisabled(t *testing.T) {
 	tg := makeTelegramWithServer(t, f, 0)
 	tg.MaxRetries = -1
 
-	if err := tg.Send(testCtx(t), "Retry", "Body"); err == nil {
+	if err := tg.Send(testCtx(t), Message{Subject: "Retry", Body: "Body"}); err == nil {
 		t.Fatal("expected error, got nil")
 	}
 	if f.sendCalls != 1 {
@@ -254,7 +375,7 @@ func TestTelegramSendRetryStopsOnContextCancel(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
-	err := tg.Send(ctx, "Retry", "Body")
+	err := tg.Send(ctx, Message{Subject: "Retry", Body: "Body"})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("expected deadline exceeded, got: %v", err)
 	}

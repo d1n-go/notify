@@ -34,12 +34,13 @@ type SlogHandlerOptions struct {
 	// errors, so without it failures are silent.
 	OnError func(error)
 
-	// Subject builds the notification subject. Defaults to "LEVEL: message".
+	// Subject builds the notification subject. Defaults to the record message.
 	Subject func(r slog.Record) string
 }
 
 // SlogHandler is a slog.Handler that sends log records through notifiers.
-// The subject is the level and message; the body lists time, source and attributes.
+// The subject is the record message, the level is passed as Message.Level
+// (converted from slog.Level), and the body lists time, source and attributes.
 //
 // It is meant to be combined with a regular handler, e.g. via slog.NewMultiHandler
 // (Go 1.26+), and wrapped notifiers are best throttled with Throttle.
@@ -67,7 +68,7 @@ func NewSlogHandler(notifiers []Notifier, opts *SlogHandlerOptions) *SlogHandler
 		h.opts.Timeout = DefaultSlogTimeout
 	}
 	if h.opts.Subject == nil {
-		h.opts.Subject = func(r slog.Record) string { return r.Level.String() + ": " + r.Message }
+		h.opts.Subject = func(r slog.Record) string { return r.Message }
 	}
 	return h
 }
@@ -77,14 +78,17 @@ func (h *SlogHandler) Enabled(_ context.Context, level slog.Level) bool {
 }
 
 func (h *SlogHandler) Handle(ctx context.Context, r slog.Record) error {
-	subject := h.opts.Subject(r)
-	body := h.body(r)
+	m := Message{
+		Subject: h.opts.Subject(r),
+		Body:    h.body(r),
+		Level:   Level(r.Level),
+	}
 
 	send := func() error {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), h.opts.Timeout)
 		defer cancel()
 
-		err := Send(ctx, h.notifiers, subject, body)
+		err := Multi(h.notifiers...).Send(ctx, m)
 		if err != nil && h.opts.OnError != nil {
 			h.opts.OnError(err)
 		}

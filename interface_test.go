@@ -11,7 +11,7 @@ type mockNotifier struct {
 	calls int
 }
 
-func (m *mockNotifier) Send(ctx context.Context, subject string, msg string) error {
+func (m *mockNotifier) Send(ctx context.Context, msg Message) error {
 	m.calls++
 	return m.err
 }

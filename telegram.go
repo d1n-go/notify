@@ -6,8 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
+	"mime/multipart"
 	"net/http"
 	"net/url"
+	"regexp"
+	"strconv"
+	"strings"
 	"time"
 	"unicode/utf16"
 )
@@ -28,8 +33,12 @@ const (
 var defaultHTTPClient = &http.Client{Timeout: 30 * time.Second}
 
 type TelegramParams struct {
-	Token              string
-	ChatID             string
+	Token  string
+	ChatID string
+
+	// MessageThreadID sends messages to a topic of a forum supergroup.
+	MessageThreadID int
+
 	DeletePrevMessages bool
 	MS                 MessageStorage
 
@@ -66,8 +75,11 @@ func NewTelegram(telegramParams TelegramParams) *Telegram {
 }
 
 type TelegramMessage struct {
-	ChatID string `json:"chat_id"`
-	Text   string `json:"text"`
+	ChatID              string `json:"chat_id"`
+	MessageThreadID     int    `json:"message_thread_id,omitempty"`
+	Text                string `json:"text"`
+	ParseMode           string `json:"parse_mode,omitempty"`
+	DisableNotification bool   `json:"disable_notification,omitempty"`
 }
 
 type TelegramResponse struct {
@@ -106,16 +118,30 @@ type networkError struct {
 func (e *networkError) Error() string { return "failed to send request: " + e.err.Error() }
 func (e *networkError) Unwrap() error { return e.err }
 
-// Send sends "[subject]\n\nmsg" to the chat. Text over the Bot API limit is truncated.
+// Send sends m to the chat as "<level emoji> [subject]\n\nbody", with ⚠️ for
+// warnings and 🔴 for errors. Text over the Bot API limit is truncated (HTML is
+// then sent as plain text, since cutting it could break tags).
+// Attachments are sent as documents replying to the message.
 // Failures to delete the previous message or to store the new message ID are ignored.
-func (t *Telegram) Send(ctx context.Context, subject string, msg string) error {
+func (t *Telegram) Send(ctx context.Context, m Message) error {
+	if err := validateAttachments(m.Attachments); err != nil {
+		return err
+	}
+
 	if t.DeletePrevMessages && t.MS != nil {
 		if prevID, err := t.MS.GetMessageID(); err == nil && prevID > 0 {
 			_ = t.deleteMessage(ctx, prevID)
 		}
 	}
 
-	msgID, err := t.sendMessage(ctx, truncateUTF16(fmt.Sprintf("[%s]\n\n%s", subject, msg), telegramMaxMessageLen))
+	text, parseMode := telegramText(m)
+	msgID, err := t.sendMessage(ctx, TelegramMessage{
+		ChatID:              t.ChatID,
+		MessageThreadID:     t.MessageThreadID,
+		Text:                text,
+		ParseMode:           parseMode,
+		DisableNotification: m.Silent,
+	})
 	if err != nil {
 		return err
 	}
@@ -123,22 +149,64 @@ func (t *Telegram) Send(ctx context.Context, subject string, msg string) error {
 	if t.DeletePrevMessages && t.MS != nil {
 		_ = t.MS.StoreMessageID(msgID)
 	}
+
+	for _, a := range m.Attachments {
+		if err := t.sendDocument(ctx, a, msgID, m.Silent); err != nil {
+			return fmt.Errorf("attachment %q: %w", a.Name, err)
+		}
+	}
 	return nil
 }
 
-// call posts payload to the Bot API method and decodes the response.
-// The bot token is never included in returned errors.
-func (t *Telegram) call(ctx context.Context, method string, payload any) (*TelegramResponse, error) {
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal payload: %w", err)
+var htmlTag = regexp.MustCompile(`<[^>]*>`)
+
+// telegramText builds the message text and its parse_mode.
+func telegramText(m Message) (string, string) {
+	var emoji string
+	switch {
+	case m.Level >= LevelError:
+		emoji = "🔴"
+	case m.Level >= LevelWarn:
+		emoji = "⚠️"
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.baseURL+t.Token+"/"+method, bytes.NewReader(data))
+	build := func(subject, body string) string {
+		var head []string
+		if emoji != "" {
+			head = append(head, emoji)
+		}
+		if subject != "" {
+			head = append(head, "["+subject+"]")
+		}
+
+		var parts []string
+		if len(head) > 0 {
+			parts = append(parts, strings.Join(head, " "))
+		}
+		if body != "" {
+			parts = append(parts, body)
+		}
+		return strings.Join(parts, "\n\n")
+	}
+
+	if m.Format == FormatHTML {
+		text := build(html.EscapeString(m.Subject), m.Body)
+		if utf16Len(text) <= telegramMaxMessageLen {
+			return text, "HTML"
+		}
+		m.Body = html.UnescapeString(htmlTag.ReplaceAllString(m.Body, ""))
+	}
+	return truncateUTF16(build(m.Subject, m.Body), telegramMaxMessageLen), ""
+}
+
+// call posts body to the Bot API method and decodes the response.
+// The bot token is never included in returned errors.
+func (t *Telegram) call(ctx context.Context, method, contentType string, body []byte) (*TelegramResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.baseURL+t.Token+"/"+method, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request for %s", method)
 	}
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Type", contentType)
 
 	client := t.HTTPClient
 	if client == nil {
@@ -174,30 +242,25 @@ func (t *Telegram) call(ctx context.Context, method string, payload any) (*Teleg
 	return &res, nil
 }
 
-// sendMessage sends msg, retrying transient failures. A retry after a network
+// callWithRetry is call with retries of transient failures. A retry after a network
 // error may duplicate the message if the first request actually reached Telegram.
-func (t *Telegram) sendMessage(ctx context.Context, msg string) (int, error) {
-	payload := TelegramMessage{
-		ChatID: t.ChatID,
-		Text:   msg,
-	}
-
+func (t *Telegram) callWithRetry(ctx context.Context, method, contentType string, body []byte) (*TelegramResponse, error) {
 	for attempt := 0; ; attempt++ {
-		res, err := t.call(ctx, "sendMessage", payload)
+		res, err := t.call(ctx, method, contentType, body)
 		if err == nil {
-			return res.Result.MessageID, nil
+			return res, nil
 		}
 
 		delay, ok := t.retryDelay(ctx, err, attempt)
 		if !ok {
-			return -1, err
+			return nil, err
 		}
 
 		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return -1, errors.Join(err, ctx.Err())
+			return nil, errors.Join(err, ctx.Err())
 		case <-timer.C:
 		}
 	}
@@ -235,27 +298,88 @@ func (t *Telegram) retryDelay(ctx context.Context, err error, attempt int) (time
 	}
 }
 
-func (t *Telegram) deleteMessage(ctx context.Context, messageID int) error {
-	_, err := t.call(ctx, "deleteMessage", map[string]any{
-		"chat_id":    t.ChatID,
-		"message_id": messageID,
-	})
+func (t *Telegram) sendMessage(ctx context.Context, msg TelegramMessage) (int, error) {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return -1, fmt.Errorf("failed to marshal payload: %w", err)
+	}
+
+	res, err := t.callWithRetry(ctx, "sendMessage", "application/json", data)
+	if err != nil {
+		return -1, err
+	}
+	return res.Result.MessageID, nil
+}
+
+// sendDocument sends a as a document replying to message replyTo.
+func (t *Telegram) sendDocument(ctx context.Context, a Attachment, replyTo int, silent bool) error {
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+
+	fields := map[string]string{
+		"chat_id":          t.ChatID,
+		"reply_parameters": fmt.Sprintf(`{"message_id":%d,"allow_sending_without_reply":true}`, replyTo),
+	}
+	if t.MessageThreadID != 0 {
+		fields["message_thread_id"] = strconv.Itoa(t.MessageThreadID)
+	}
+	if silent {
+		fields["disable_notification"] = "true"
+	}
+	for k, v := range fields {
+		if err := w.WriteField(k, v); err != nil {
+			return err
+		}
+	}
+
+	name := a.Name
+	if name == "" {
+		name = "attachment"
+	}
+	fw, err := w.CreateFormFile("document", name)
+	if err != nil {
+		return err
+	}
+	if _, err := fw.Write(a.Data); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+
+	_, err = t.callWithRetry(ctx, "sendDocument", w.FormDataContentType(), buf.Bytes())
 	return err
 }
 
-// truncateUTF16 cuts s to at most limit UTF-16 code units, ending with "…" if cut.
-func truncateUTF16(s string, limit int) string {
+func (t *Telegram) deleteMessage(ctx context.Context, messageID int) error {
+	data, err := json.Marshal(map[string]any{
+		"chat_id":    t.ChatID,
+		"message_id": messageID,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = t.call(ctx, "deleteMessage", "application/json", data)
+	return err
+}
+
+func utf16Len(s string) int {
 	n := 0
 	for _, r := range s {
 		n += utf16.RuneLen(r)
 	}
-	if n <= limit {
+	return n
+}
+
+// truncateUTF16 cuts s to at most limit UTF-16 code units, ending with "…" if cut.
+func truncateUTF16(s string, limit int) string {
+	if utf16Len(s) <= limit {
 		return s
 	}
 
 	const ellipsis = '…'
 	limit -= utf16.RuneLen(ellipsis)
-	n = 0
+	n := 0
 	for i, r := range s {
 		n += utf16.RuneLen(r)
 		if n > limit {

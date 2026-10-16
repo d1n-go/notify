@@ -15,10 +15,10 @@ type recordingNotifier struct {
 	err  error
 }
 
-func (r *recordingNotifier) Send(ctx context.Context, subject string, msg string) error {
+func (r *recordingNotifier) Send(ctx context.Context, m Message) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.msgs = append(r.msgs, msg)
+	r.msgs = append(r.msgs, m.Body)
 	return r.err
 }
 
@@ -46,7 +46,7 @@ func TestThrottleSuppressesDuplicates(t *testing.T) {
 	ctx := context.Background()
 
 	for range 3 {
-		if err := th.Send(ctx, "s", "disk full"); err != nil {
+		if err := th.Send(ctx, Message{Subject: "s", Body: "disk full"}); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		clock.advance(10 * time.Second)
@@ -56,7 +56,7 @@ func TestThrottleSuppressesDuplicates(t *testing.T) {
 	}
 
 	clock.advance(time.Minute)
-	_ = th.Send(ctx, "s", "disk full")
+	_ = th.Send(ctx, Message{Subject: "s", Body: "disk full"})
 
 	got := rec.sent()
 	if len(got) != 2 {
@@ -72,9 +72,9 @@ func TestThrottleDifferentMessagesPass(t *testing.T) {
 	th, _ := newTestThrottle(rec, ThrottleParams{Window: time.Minute})
 	ctx := context.Background()
 
-	_ = th.Send(ctx, "s", "a")
-	_ = th.Send(ctx, "s", "b")
-	_ = th.Send(ctx, "other", "a")
+	_ = th.Send(ctx, Message{Subject: "s", Body: "a"})
+	_ = th.Send(ctx, Message{Subject: "s", Body: "b"})
+	_ = th.Send(ctx, Message{Subject: "other", Body: "a"})
 
 	if got := rec.sent(); len(got) != 3 {
 		t.Errorf("expected 3 distinct messages, got %d", len(got))
@@ -85,12 +85,12 @@ func TestThrottleCustomKey(t *testing.T) {
 	rec := &recordingNotifier{}
 	th, _ := newTestThrottle(rec, ThrottleParams{
 		Window: time.Minute,
-		Key:    func(subject, msg string) string { return "" }, // одно сообщение в минуту на всё
+		Key:    func(m Message) string { return "" }, // одно сообщение в минуту на всё
 	})
 	ctx := context.Background()
 
-	_ = th.Send(ctx, "a", "1")
-	_ = th.Send(ctx, "b", "2")
+	_ = th.Send(ctx, Message{Subject: "a", Body: "1"})
+	_ = th.Send(ctx, Message{Subject: "b", Body: "2"})
 
 	if got := rec.sent(); len(got) != 1 {
 		t.Errorf("expected global limit of 1 message, got %d", len(got))
@@ -102,20 +102,20 @@ func TestThrottleFailedSendDoesNotCount(t *testing.T) {
 	th, clock := newTestThrottle(rec, ThrottleParams{Window: time.Minute})
 	ctx := context.Background()
 
-	if err := th.Send(ctx, "s", "m"); err == nil {
+	if err := th.Send(ctx, Message{Subject: "s", Body: "m"}); err == nil {
 		t.Fatal("expected error from wrapped notifier")
 	}
 	clock.advance(time.Second)
 
 	rec.err = nil
-	if err := th.Send(ctx, "s", "m"); err != nil {
+	if err := th.Send(ctx, Message{Subject: "s", Body: "m"}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if got := rec.sent(); len(got) != 2 {
 		t.Errorf("expected retry right after failure, got %d sends", len(got))
 	}
 
-	_ = th.Send(ctx, "s", "m")
+	_ = th.Send(ctx, Message{Subject: "s", Body: "m"})
 	if got := rec.sent(); len(got) != 2 {
 		t.Errorf("expected throttling after successful send, got %d sends", len(got))
 	}
@@ -126,15 +126,15 @@ func TestThrottleKeepsSuppressedCountAfterFailure(t *testing.T) {
 	th, clock := newTestThrottle(rec, ThrottleParams{Window: time.Minute})
 	ctx := context.Background()
 
-	_ = th.Send(ctx, "s", "m")
-	_ = th.Send(ctx, "s", "m") // suppressed
+	_ = th.Send(ctx, Message{Subject: "s", Body: "m"})
+	_ = th.Send(ctx, Message{Subject: "s", Body: "m"}) // suppressed
 	clock.advance(time.Minute)
 
 	rec.err = errors.New("down")
-	_ = th.Send(ctx, "s", "m") // fails, carries "1 suppressed"
+	_ = th.Send(ctx, Message{Subject: "s", Body: "m"}) // fails, carries "1 suppressed"
 
 	rec.err = nil
-	_ = th.Send(ctx, "s", "m")
+	_ = th.Send(ctx, Message{Subject: "s", Body: "m"})
 
 	got := rec.sent()
 	if last := got[len(got)-1]; !strings.HasSuffix(last, "(similar messages suppressed: 1)") {
@@ -146,10 +146,10 @@ func TestThrottleSweepsExpiredEntries(t *testing.T) {
 	th, clock := newTestThrottle(&recordingNotifier{}, ThrottleParams{Window: time.Minute})
 	ctx := context.Background()
 
-	_ = th.Send(ctx, "s", "a")
-	_ = th.Send(ctx, "s", "b")
+	_ = th.Send(ctx, Message{Subject: "s", Body: "a"})
+	_ = th.Send(ctx, Message{Subject: "s", Body: "b"})
 	clock.advance(2 * time.Minute)
-	_ = th.Send(ctx, "s", "c")
+	_ = th.Send(ctx, Message{Subject: "s", Body: "c"})
 
 	if n := len(th.entries); n != 1 {
 		t.Errorf("expected expired entries to be swept, got %d entries", n)
@@ -160,8 +160,8 @@ func TestThrottleDisabled(t *testing.T) {
 	rec := &recordingNotifier{}
 	th := Throttle(rec, ThrottleParams{})
 
-	_ = th.Send(context.Background(), "s", "m")
-	_ = th.Send(context.Background(), "s", "m")
+	_ = th.Send(context.Background(), Message{Subject: "s", Body: "m"})
+	_ = th.Send(context.Background(), Message{Subject: "s", Body: "m"})
 
 	if got := rec.sent(); len(got) != 2 {
 		t.Errorf("expected no throttling with zero window, got %d", len(got))
@@ -177,7 +177,7 @@ func TestThrottleConcurrent(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_ = th.Send(context.Background(), "s", "m")
+			_ = th.Send(context.Background(), Message{Subject: "s", Body: "m"})
 		}()
 	}
 	wg.Wait()

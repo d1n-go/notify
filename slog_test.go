@@ -11,45 +11,38 @@ import (
 	"time"
 )
 
-type sentMessage struct {
-	subject, msg string
-}
-
 type capturingNotifier struct {
 	mu   sync.Mutex
-	msgs []sentMessage
+	msgs []Message
 	err  error
 }
 
-func (c *capturingNotifier) Send(ctx context.Context, subject string, msg string) error {
+func (c *capturingNotifier) Send(ctx context.Context, m Message) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.msgs = append(c.msgs, sentMessage{subject, msg})
+	c.msgs = append(c.msgs, m)
 	return c.err
 }
 
-func (c *capturingNotifier) sent() []sentMessage {
+func (c *capturingNotifier) sent() []Message {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return append([]sentMessage(nil), c.msgs...)
+	return append([]Message(nil), c.msgs...)
 }
 
 // parseSlogMessage turns a notification back into the map form slogtest expects.
-func parseSlogMessage(t *testing.T, m sentMessage) map[string]any {
+func parseSlogMessage(t *testing.T, m Message) map[string]any {
 	t.Helper()
 
-	res := map[string]any{}
-	level, msg, ok := strings.Cut(m.subject, ": ")
-	if !ok {
-		t.Fatalf("unexpected subject %q", m.subject)
+	res := map[string]any{
+		slog.LevelKey:   m.Level.String(),
+		slog.MessageKey: m.Subject,
 	}
-	res[slog.LevelKey] = level
-	res[slog.MessageKey] = msg
 
-	if m.msg == "" {
+	if m.Body == "" {
 		return res
 	}
-	for _, line := range strings.Split(m.msg, "\n") {
+	for _, line := range strings.Split(m.Body, "\n") {
 		key, val, ok := strings.Cut(line, ": ")
 		if !ok {
 			t.Fatalf("unexpected body line %q", line)
@@ -100,12 +93,12 @@ func TestSlogHandlerFormat(t *testing.T) {
 	if len(sent) != 1 {
 		t.Fatalf("expected 1 notification, got %d", len(sent))
 	}
-	if sent[0].subject != "ERROR: payment failed" {
-		t.Errorf("unexpected subject %q", sent[0].subject)
+	if sent[0].Subject != "payment failed" || sent[0].Level != LevelError {
+		t.Errorf("unexpected subject or level: %q, %v", sent[0].Subject, sent[0].Level)
 	}
 	for _, want := range []string{"time: ", "source: ", "slog_test.go:", "service: billing", "req.id: 42", "req.user.name: ivan", "req.err: timeout"} {
-		if !strings.Contains(sent[0].msg, want) {
-			t.Errorf("body misses %q:\n%s", want, sent[0].msg)
+		if !strings.Contains(sent[0].Body, want) {
+			t.Errorf("body misses %q:\n%s", want, sent[0].Body)
 		}
 	}
 }
@@ -118,7 +111,7 @@ func TestSlogHandlerLevel(t *testing.T) {
 	logger.Warn("warn")
 	logger.Error("error")
 
-	if sent := n.sent(); len(sent) != 1 || sent[0].subject != "ERROR: error" {
+	if sent := n.sent(); len(sent) != 1 || sent[0].Subject != "error" || sent[0].Level != LevelError {
 		t.Errorf("expected only error records by default, got %+v", sent)
 	}
 }
@@ -137,7 +130,7 @@ func TestSlogHandlerOnError(t *testing.T) {
 
 func TestSlogHandlerIgnoresCallerCancellation(t *testing.T) {
 	var gotErr error
-	n := notifierFunc(func(ctx context.Context, subject, msg string) error {
+	n := notifierFunc(func(ctx context.Context, m Message) error {
 		gotErr = ctx.Err()
 		return nil
 	})
@@ -156,9 +149,9 @@ func TestSlogHandlerIgnoresCallerCancellation(t *testing.T) {
 func TestSlogHandlerAsync(t *testing.T) {
 	release := make(chan struct{})
 	n := &capturingNotifier{}
-	slow := notifierFunc(func(ctx context.Context, subject, msg string) error {
+	slow := notifierFunc(func(ctx context.Context, m Message) error {
 		<-release
-		return n.Send(ctx, subject, msg)
+		return n.Send(ctx, m)
 	})
 	h := NewSlogHandler([]Notifier{slow}, &SlogHandlerOptions{Async: true})
 
@@ -182,8 +175,8 @@ func TestSlogHandlerAsync(t *testing.T) {
 	}
 }
 
-type notifierFunc func(ctx context.Context, subject, msg string) error
+type notifierFunc func(ctx context.Context, m Message) error
 
-func (f notifierFunc) Send(ctx context.Context, subject, msg string) error {
-	return f(ctx, subject, msg)
+func (f notifierFunc) Send(ctx context.Context, m Message) error {
+	return f(ctx, m)
 }

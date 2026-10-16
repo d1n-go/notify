@@ -13,17 +13,17 @@ type ThrottleParams struct {
 	// Zero or negative disables throttling.
 	Window time.Duration
 
-	// Key groups messages that throttle each other. Defaults to subject and msg
+	// Key groups messages that throttle each other. Defaults to subject and body
 	// together, i.e. identical messages. Use the subject alone for alerts whose
 	// text varies, or a constant to allow at most one message per Window overall.
-	Key func(subject, msg string) string
+	Key func(m Message) string
 }
 
 // Throttled is a Notifier that drops repeated messages, see Throttle.
 type Throttled struct {
 	next   Notifier
 	window time.Duration
-	key    func(subject, msg string) string
+	key    func(m Message) string
 	now    func() time.Time
 
 	mu        sync.Mutex
@@ -43,7 +43,7 @@ type throttleEntry struct {
 func Throttle(n Notifier, p ThrottleParams) *Throttled {
 	key := p.Key
 	if key == nil {
-		key = func(subject, msg string) string { return subject + "\x00" + msg }
+		key = func(m Message) string { return m.Subject + "\x00" + m.Body }
 	}
 	return &Throttled{
 		next:    n,
@@ -54,12 +54,12 @@ func Throttle(n Notifier, p ThrottleParams) *Throttled {
 	}
 }
 
-func (t *Throttled) Send(ctx context.Context, subject string, msg string) error {
+func (t *Throttled) Send(ctx context.Context, m Message) error {
 	if t.window <= 0 {
-		return t.next.Send(ctx, subject, msg)
+		return t.next.Send(ctx, m)
 	}
 
-	k := t.key(subject, msg)
+	k := t.key(m)
 	now := t.now()
 
 	t.mu.Lock()
@@ -78,10 +78,10 @@ func (t *Throttled) Send(ctx context.Context, subject string, msg string) error 
 	t.mu.Unlock()
 
 	if suppressed > 0 {
-		msg += fmt.Sprintf("\n\n(similar messages suppressed: %d)", suppressed)
+		m.Body += fmt.Sprintf("\n\n(similar messages suppressed: %d)", suppressed)
 	}
 
-	err := t.next.Send(ctx, subject, msg)
+	err := t.next.Send(ctx, m)
 	if err != nil {
 		t.mu.Lock()
 		if t.entries[k] == e && e.sentAt.Equal(now) {

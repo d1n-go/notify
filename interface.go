@@ -2,22 +2,14 @@ package notify
 
 import (
 	"context"
-	"errors"
 )
 
 type Notifier interface {
-	Send(ctx context.Context, subject string, msg string) error
+	Send(ctx context.Context, m Message) error
 }
 
-// Send sends the message through every notifier, even if some of them fail.
-// It returns all errors joined with errors.Join, or nil if every send succeeded.
+// Send sends a plain text message with the given subject through every notifier.
+// It is a shortcut for Multi(notifiers...).Send(ctx, Message{Subject: subject, Body: msg}).
 func Send(ctx context.Context, notifiers []Notifier, subject string, msg string) error {
-	var errs []error
-	for _, n := range notifiers {
-		if err := n.Send(ctx, subject, msg); err != nil {
-			errs = append(errs, err)
-		}
-	}
-
-	return errors.Join(errs...)
+	return Multi(notifiers...).Send(ctx, Message{Subject: subject, Body: msg})
 }
